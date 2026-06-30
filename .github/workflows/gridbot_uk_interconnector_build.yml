@@ -1,0 +1,102 @@
+name: GridBot UK Interconnector Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_month:
+        description: First month YYYY-MM
+        required: true
+        default: '2020-12'
+      end_month:
+        description: Last month YYYY-MM or latest-complete
+        required: true
+        default: 'latest-complete'
+      fail_on_reconciliation_mismatch:
+        description: Fail if monolith reconciliation is not exact within tolerance
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gridbot-uk-interconnector-build
+  cancel-in-progress: false
+
+jobs:
+  uk-interconnector-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout data-interconnectors
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync latest main before processing
+        run: git pull --ff-only origin main
+
+      - name: Clone monolith oracle
+        run: |
+          rm -rf _monolith
+          git clone --depth 1 https://github.com/Ventusltd/globalgrid2050.git _monolith
+
+      - name: Verify monolith interconnector oracle
+        run: |
+          set -euo pipefail
+          ORACLE_DIR="_monolith/uk_energy_tracking_v6/generation_history/interconnectors"
+          if [ ! -d "$ORACLE_DIR" ]; then
+            echo "Monolith interconnector oracle directory missing: $ORACLE_DIR"
+            exit 1
+          fi
+          COUNT=$(find "$ORACLE_DIR" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')
+          echo "Monolith interconnector oracle JSON files: $COUNT"
+          if [ "$COUNT" -lt 1 ]; then
+            echo "No monolith interconnector oracle JSON files found. Cannot reconcile."
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install duckdb pyarrow requests
+
+      - name: Run UK interconnector build
+        env:
+          START_MONTH: ${{ github.event.inputs.start_month }}
+          END_MONTH: ${{ github.event.inputs.end_month }}
+          FAIL_RECON: ${{ github.event.inputs.fail_on_reconciliation_mismatch }}
+        run: |
+          set -euo pipefail
+          FLAGS=""
+          if [ "$FAIL_RECON" = "false" ]; then
+            FLAGS="--allow-reconciliation-mismatch"
+          fi
+          python pipelines/build_interconnectors.py \
+            --start "$START_MONTH" \
+            --end "$END_MONTH" \
+            $FLAGS
+
+      - name: Commit generated outputs
+        run: |
+          set -euo pipefail
+          git config user.name "Gridbot"
+          git config user.email "gridbot@users.noreply.github.com"
+          git add flows rollups reports CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No generated output changes to commit."
+          else
+            git commit -m "data: build UK interconnector flow parquet"
+            git pull --ff-only origin main
+            git push origin HEAD:main
+          fi
