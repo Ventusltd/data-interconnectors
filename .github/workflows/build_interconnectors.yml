@@ -25,11 +25,11 @@ on:
       fail_on_reconciliation_mismatch:
         description: Fail if monolith reconciliation is not exact within tolerance
         required: true
-        default: "false"
+        default: "true"
         type: choice
         options:
-          - "false"
           - "true"
+          - "false"
 
 permissions:
   contents: write
@@ -62,18 +62,18 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install duckdb pandas pyarrow requests
+          pip install duckdb pyarrow requests
 
       - name: Build interconnector Parquet and rollups
         env:
           START_MONTH: ${{ github.event.inputs.start_month || '2020-12' }}
           END_MONTH: ${{ github.event.inputs.end_month || 'latest-complete' }}
-          FAIL_RECON: ${{ github.event.inputs.fail_on_reconciliation_mismatch || 'false' }}
+          FAIL_RECON: ${{ github.event.inputs.fail_on_reconciliation_mismatch || 'true' }}
         run: |
           set -euo pipefail
           FLAGS=""
-          if [ "$FAIL_RECON" = "true" ]; then
-            FLAGS="--fail-on-reconciliation-mismatch"
+          if [ "$FAIL_RECON" = "false" ]; then
+            FLAGS="--allow-reconciliation-mismatch"
           fi
           python pipelines/build_interconnectors.py \
             --start "$START_MONTH" \
