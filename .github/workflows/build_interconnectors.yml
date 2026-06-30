@@ -1,17 +1,6 @@
 name: Build UK Interconnector Flows
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/build_interconnectors.yml"
-      - "pipelines/build_interconnectors.py"
-      - "README.md"
-      - "DATA_SOURCES.md"
-      - "DEPENDENCIES.md"
-      - "IMPLEMENTATION.md"
-      - "reference/interconnector_cables.csv"
   workflow_dispatch:
     inputs:
       start_month:
@@ -34,8 +23,6 @@ on:
 permissions:
   contents: write
 
-timeout-minutes: 45
-
 concurrency:
   group: build-uk-interconnector-flows
   cancel-in-progress: false
@@ -43,6 +30,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout data-interconnectors
         uses: actions/checkout@v4
