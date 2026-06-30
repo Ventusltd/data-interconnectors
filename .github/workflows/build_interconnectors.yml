@@ -1,0 +1,94 @@
+name: Build UK Interconnector Flows
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build_interconnectors.yml"
+      - "pipelines/build_interconnectors.py"
+      - "README.md"
+      - "DATA_SOURCES.md"
+      - "DEPENDENCIES.md"
+      - "IMPLEMENTATION.md"
+      - "reference/interconnector_cables.csv"
+  workflow_dispatch:
+    inputs:
+      start_month:
+        description: First month YYYY-MM
+        required: true
+        default: "2020-12"
+      end_month:
+        description: Last month YYYY-MM, or latest-complete
+        required: true
+        default: "latest-complete"
+      fail_on_reconciliation_mismatch:
+        description: Fail if monolith reconciliation is not exact within tolerance
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+timeout-minutes: 45
+
+concurrency:
+  group: build-uk-interconnector-flows
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout data-interconnectors
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone monolith oracle
+        run: |
+          rm -rf _monolith
+          git clone --depth 1 https://github.com/Ventusltd/globalgrid2050.git _monolith
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install duckdb pandas pyarrow requests
+
+      - name: Build interconnector Parquet and rollups
+        env:
+          START_MONTH: ${{ github.event.inputs.start_month || '2020-12' }}
+          END_MONTH: ${{ github.event.inputs.end_month || 'latest-complete' }}
+          FAIL_RECON: ${{ github.event.inputs.fail_on_reconciliation_mismatch || 'false' }}
+        run: |
+          set -euo pipefail
+          FLAGS=""
+          if [ "$FAIL_RECON" = "true" ]; then
+            FLAGS="--fail-on-reconciliation-mismatch"
+          fi
+          python pipelines/build_interconnectors.py \
+            --start "$START_MONTH" \
+            --end "$END_MONTH" \
+            $FLAGS
+
+      - name: Commit generated data and reports
+        run: |
+          set -euo pipefail
+          git config user.name "Gridbot"
+          git config user.email "gridbot@users.noreply.github.com"
+          git add flows rollups reports CHANGELOG.md README.md DATA_SOURCES.md DEPENDENCIES.md IMPLEMENTATION.md reference/interconnector_cables.csv pipelines/build_interconnectors.py .github/workflows/build_interconnectors.yml
+          if git diff --cached --quiet; then
+            echo "No generated data changes to commit."
+          else
+            git commit -m "data: build UK interconnector flow parquet"
+            git push origin HEAD:main
+          fi
