@@ -87,6 +87,15 @@ jobs:
             --end "$END_MONTH" \
             $FLAGS
 
+      - name: Upload interconnector build report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uk-interconnector-build-report
+          path: |
+            reports/INTERCONNECTOR_BUILD_LATEST.md
+            reports/json/INTERCONNECTOR_BUILD_LATEST.json
+
       - name: Commit generated outputs
         run: |
           set -euo pipefail
