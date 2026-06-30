@@ -2,25 +2,25 @@
 from __future__ import annotations
 
 import argparse
-import calendar
 import datetime as dt
 import json
 import math
 import shutil
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 import duckdb
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 API_URL = "https://data.elexon.co.uk/bmrs/api/v1/datasets/FUELINST"
-METHOD_VERSION = "fuelinst_interconnector_v1_20260630"
+METHOD_VERSION = "fuelinst_interconnector_v2_inferred_interval_20260630"
 SOURCE = "Elexon BMRS FUELINST"
-INTERVAL_HOURS = 5 / 60
+DEFAULT_INTERVAL_HOURS = 5 / 60
+MAX_INFERRED_INTERVAL_HOURS = 1.0
 
 INTERCONNECTORS = [
     {"bmrsCode": "INTFR", "country": "France", "interconnectorName": "IFA", "capacityGW": 2.0},
@@ -151,14 +151,27 @@ def fetch_month(year: int, month: int, timeout: int) -> list[dict[str, Any]]:
     return rows
 
 
+def infer_interval(items: list[dict[str, Any]], index: int) -> tuple[float, str]:
+    t = items[index]["_time"]
+    if index + 1 < len(items):
+        gap = (items[index + 1]["_time"] - t).total_seconds() / 3600
+        if 0 < gap <= MAX_INFERRED_INTERVAL_HOURS:
+            return gap, "next_gap"
+    if index > 0:
+        gap = (t - items[index - 1]["_time"]).total_seconds() / 3600
+        if 0 < gap <= MAX_INFERRED_INTERVAL_HOURS:
+            return gap, "previous_gap"
+    return DEFAULT_INTERVAL_HOURS, "default_5min"
+
+
 def normalise_month(year: int, month: int, raw_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     start = month_start(year, month)
     ny, nm = next_month(year, month)
     end = month_start(ny, nm)
     fetched = utcnow()
-    dedup: dict[tuple[str, str], dict[str, Any]] = {}
+    raw_dedup: dict[tuple[str, str], dict[str, Any]] = {}
     schema_errors = 0
-    matched_codes = set()
+    seen_candidate = 0
     for row in raw_rows:
         code = pick(row, CODE_KEYS)
         if code is None:
@@ -166,6 +179,7 @@ def normalise_month(year: int, month: int, raw_rows: list[dict[str, Any]]) -> tu
         code = str(code).strip().upper()
         if code not in CODES:
             continue
+        seen_candidate += 1
         t = parse_time(pick(row, TIME_KEYS))
         mw = parse_float(pick(row, MW_KEYS))
         if t is None or mw is None:
@@ -173,35 +187,58 @@ def normalise_month(year: int, month: int, raw_rows: list[dict[str, Any]]) -> tu
             continue
         if not (start <= t < end):
             continue
-        spec = SPEC[code]
         period = iso_z(t)
-        direction = "import" if mw >= 0 else "export"
-        matched_codes.add(code)
-        dedup[(period, code)] = {
-            "periodStartUTC": period,
-            "bmrsCode": code,
-            "interconnectorName": spec["interconnectorName"],
-            "country": spec["country"],
-            "flowDirection": direction,
-            "signedMW": round(float(mw), 6),
-            "grossMWh": round(abs(float(mw)) * INTERVAL_HOURS, 9),
-            "signedMWh": round(float(mw) * INTERVAL_HOURS, 9),
-            "intervalHours": INTERVAL_HOURS,
-            "source": SOURCE,
-            "methodVersion": METHOD_VERSION,
-            "fetchedAtUTC": fetched,
-            "year": year,
-            "month": month,
-        }
-    rows = sorted(dedup.values(), key=lambda r: (r["periodStartUTC"], r["bmrsCode"]))
+        raw_dedup[(period, code)] = {"_time": t, "periodStartUTC": period, "bmrsCode": code, "signedMW": float(mw)}
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for rec in raw_dedup.values():
+        grouped[rec["bmrsCode"]].append(rec)
+    for code in grouped:
+        grouped[code].sort(key=lambda r: r["_time"])
+
+    rows: list[dict[str, Any]] = []
+    interval_sources: Counter[str] = Counter()
+    intervals: list[float] = []
+    for code in sorted(grouped):
+        items = grouped[code]
+        for i, rec in enumerate(items):
+            interval_hours, interval_source = infer_interval(items, i)
+            interval_sources[interval_source] += 1
+            intervals.append(interval_hours)
+            spec = SPEC[code]
+            mw = rec["signedMW"]
+            direction = "import" if mw >= 0 else "export"
+            rows.append({
+                "periodStartUTC": rec["periodStartUTC"],
+                "bmrsCode": code,
+                "interconnectorName": spec["interconnectorName"],
+                "country": spec["country"],
+                "flowDirection": direction,
+                "signedMW": round(float(mw), 6),
+                "grossMWh": round(abs(float(mw)) * interval_hours, 9),
+                "signedMWh": round(float(mw) * interval_hours, 9),
+                "intervalHours": round(interval_hours, 9),
+                "intervalSource": interval_source,
+                "source": SOURCE,
+                "methodVersion": METHOD_VERSION,
+                "fetchedAtUTC": fetched,
+                "year": year,
+                "month": month,
+            })
+    rows.sort(key=lambda r: (r["periodStartUTC"], r["bmrsCode"]))
     if not rows:
-        raise RuntimeError(f"No interconnector rows after filtering for {year:04d}-{month:02d}; schema_errors={schema_errors}")
+        raise RuntimeError(f"No interconnector rows after filtering for {year:04d}-{month:02d}; schema_errors={schema_errors}; candidate={seen_candidate}")
     meta = {
         "month": f"{year:04d}-{month:02d}",
         "apiRows": len(raw_rows),
+        "candidateInterconnectorRows": seen_candidate,
         "interconnectorRows": len(rows),
         "schemaErrors": schema_errors,
-        "codesPresent": sorted(matched_codes),
+        "codesPresent": sorted(grouped.keys()),
+        "dedupedDroppedRows": max(0, seen_candidate - len(raw_dedup) - schema_errors),
+        "intervalSourceCounts": dict(sorted(interval_sources.items())),
+        "intervalHoursMin": round(min(intervals), 9) if intervals else None,
+        "intervalHoursMax": round(max(intervals), 9) if intervals else None,
     }
     return rows, meta
 
@@ -451,6 +488,12 @@ def write_reports(report: dict[str, Any]) -> None:
         f"- Monthly rollup rows: `{report['rollups']['monthlyRows']}`",
         f"- Annual rollup rows: `{report['rollups']['annualRows']}`",
         "",
+        "## Interval method",
+        "",
+        f"- Default interval hours: `{DEFAULT_INTERVAL_HOURS}`",
+        f"- Max inferred interval hours: `{MAX_INFERRED_INTERVAL_HOURS}`",
+        "- Interval hours are inferred per BMRS code from neighbouring readings, with previous-gap/default fallback.",
+        "",
         "## Latest complete month code check",
         "",
         "```text",
@@ -479,7 +522,7 @@ def write_reports(report: dict[str, Any]) -> None:
 def update_changelog(report: dict[str, Any]) -> None:
     path = ROOT / "CHANGELOG.md"
     old = path.read_text(encoding="utf-8") if path.exists() else "# CHANGELOG.md\n\n"
-    entry = f"""\n---\n\n## {dt.date.today().isoformat()} — UK interconnector Parquet build result\n\nBuilt the UK interconnector flow data product from fresh Elexon BMRS FUELINST API windows.\n\nRange: `{report['startMonth']}` to `{report['endMonth']}`.\n\nFlow rows: `{report['verification']['rows']}`. Distinct declared keys: `{report['verification']['distinctKeys']}`. Duplicate key groups: `{report['verification']['duplicateKeyGroups']}`. Null key rows: `{report['verification']['nullKeyRows']}`.\n\nFlow parquet files: `{report['verification']['parquetFiles']}`. Flow parquet MB: `{report['verification']['flowsMb']}`. Monthly rollup rows: `{report['rollups']['monthlyRows']}`. Annual rollup rows: `{report['rollups']['annualRows']}`.\n\nMonolith reconciliation checked `{report['reconciliation']['checkedOverlapKeys']}` overlapping keys, matched `{report['reconciliation']['matchedWithinTolerance']}` within tolerance, missing `{report['reconciliation']['missingInFresh']}`, mismatched `{report['reconciliation']['mismatched']}`. Accuracy proven: `{report['reconciliation']['accuracyProven']}`.\n\n"""
+    entry = f"""\n---\n\n## {dt.date.today().isoformat()} — UK interconnector Parquet build result\n\nBuilt the UK interconnector flow data product from fresh Elexon BMRS FUELINST API windows.\n\nRange: `{report['startMonth']}` to `{report['endMonth']}`.\n\nFlow rows: `{report['verification']['rows']}`. Distinct declared keys: `{report['verification']['distinctKeys']}`. Duplicate key groups: `{report['verification']['duplicateKeyGroups']}`. Null key rows: `{report['verification']['nullKeyRows']}`.\n\nFlow parquet files: `{report['verification']['parquetFiles']}`. Flow parquet MB: `{report['verification']['flowsMb']}`. Monthly rollup rows: `{report['rollups']['monthlyRows']}`. Annual rollup rows: `{report['rollups']['annualRows']}`.\n\nInterval method: inferred per BMRS code from actual reading spacing, with a one-hour cap and default five-minute fallback.\n\nMonolith reconciliation checked `{report['reconciliation']['checkedOverlapKeys']}` overlapping keys, matched `{report['reconciliation']['matchedWithinTolerance']}` within tolerance, missing `{report['reconciliation']['missingInFresh']}`, mismatched `{report['reconciliation']['mismatched']}`. Accuracy proven: `{report['reconciliation']['accuracyProven']}`.\n\n"""
     if "---\n" in old:
         head, tail = old.split("---\n", 1)
         path.write_text(head + entry + tail, encoding="utf-8")
@@ -493,7 +536,8 @@ def main() -> int:
     ap.add_argument("--end", default="latest-complete")
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--monolith-dir", default="_monolith/uk_energy_tracking_v6/generation_history/interconnectors")
-    ap.add_argument("--fail-on-reconciliation-mismatch", action="store_true")
+    ap.add_argument("--fail-on-reconciliation-mismatch", dest="fail_on_reconciliation_mismatch", action="store_true", default=True)
+    ap.add_argument("--allow-reconciliation-mismatch", dest="fail_on_reconciliation_mismatch", action="store_false")
     args = ap.parse_args()
 
     end = latest_complete_month() if args.end == "latest-complete" else args.end
@@ -511,13 +555,31 @@ def main() -> int:
         rows, meta = normalise_month(y, m, raw)
         write_month(rows, y, m)
         month_reports.append(meta)
-        print(f"{y:04d}-{m:02d}: api={meta['apiRows']} interconnector={meta['interconnectorRows']} codes={','.join(meta['codesPresent'])}")
+        print(f"{y:04d}-{m:02d}: api={meta['apiRows']} interconnector={meta['interconnectorRows']} codes={','.join(meta['codesPresent'])} intervals={meta['intervalSourceCounts']}")
 
     rollups = build_rollups()
     verification = verify_output(end)
     reconciliation = reconcile(ROOT / args.monolith_dir)
     if args.fail_on_reconciliation_mismatch and not reconciliation.get("accuracyProven"):
-        raise RuntimeError("monolith reconciliation did not prove accuracy; see report examples")
+        report = {
+            "generatedUTC": utcnow(),
+            "startMonth": args.start,
+            "endMonth": end,
+            "methodVersion": METHOD_VERSION,
+            "source": SOURCE,
+            "apiUrl": API_URL,
+            "signConvention": "positive signed MW is import to GB; negative signed MW is export from GB",
+            "intervalMethod": "inferred per BMRS code from neighbouring readings; max one hour; default five minutes",
+            "defaultIntervalHours": DEFAULT_INTERVAL_HOURS,
+            "maxInferredIntervalHours": MAX_INFERRED_INTERVAL_HOURS,
+            "operationalCodes": sorted(CODES),
+            "months": month_reports,
+            "verification": verification,
+            "rollups": rollups,
+            "reconciliation": reconciliation,
+        }
+        write_reports(report)
+        raise RuntimeError("monolith reconciliation did not prove accuracy; see reports/INTERCONNECTOR_BUILD_LATEST.md")
 
     report = {
         "generatedUTC": utcnow(),
@@ -527,7 +589,9 @@ def main() -> int:
         "source": SOURCE,
         "apiUrl": API_URL,
         "signConvention": "positive signed MW is import to GB; negative signed MW is export from GB",
-        "intervalHours": INTERVAL_HOURS,
+        "intervalMethod": "inferred per BMRS code from neighbouring readings; max one hour; default five minutes",
+        "defaultIntervalHours": DEFAULT_INTERVAL_HOURS,
+        "maxInferredIntervalHours": MAX_INFERRED_INTERVAL_HOURS,
         "operationalCodes": sorted(CODES),
         "months": month_reports,
         "verification": verification,
