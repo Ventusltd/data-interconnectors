@@ -1,16 +1,30 @@
 name: GridBot UK Interconnector Build
 
 on:
+  schedule:
+    - cron: '17 6 2 * *'
   workflow_dispatch:
     inputs:
-      start_month:
-        description: First month YYYY-MM
+      mode:
+        description: Run mode
         required: true
-        default: '2020-12'
+        default: 'monthly'
+        type: choice
+        options:
+          - 'monthly'
+          - 'full'
+      start_month:
+        description: First month YYYY-MM, or auto for monthly mode
+        required: true
+        default: 'auto'
       end_month:
         description: Last month YYYY-MM or latest-complete
         required: true
         default: 'latest-complete'
+      refetch_months:
+        description: Recent complete months to refresh in monthly mode
+        required: true
+        default: '3'
       fail_on_reconciliation_mismatch:
         description: Fail if monolith reconciliation is not exact within tolerance
         required: true
@@ -30,13 +44,20 @@ concurrency:
 jobs:
   uk-interconnector-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
+    env:
+      RUN_MODE: ${{ github.event.inputs.mode || 'monthly' }}
+      START_MONTH: ${{ github.event.inputs.start_month || 'auto' }}
+      END_MONTH: ${{ github.event.inputs.end_month || 'latest-complete' }}
+      REFETCH_MONTHS: ${{ github.event.inputs.refetch_months || '3' }}
+      FAIL_RECON: ${{ github.event.inputs.fail_on_reconciliation_mismatch || 'true' }}
 
     steps:
-      - name: Checkout data-interconnectors
+      - name: Checkout data-interconnectors using GridBot PAT
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GRIDBOT_PAT }}
 
       - name: Sync latest main before processing
         run: git pull --ff-only origin main
@@ -68,24 +89,26 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install duckdb pyarrow requests
 
-      - name: Run UK interconnector build
-        env:
-          START_MONTH: ${{ github.event.inputs.start_month }}
-          END_MONTH: ${{ github.event.inputs.end_month }}
-          FAIL_RECON: ${{ github.event.inputs.fail_on_reconciliation_mismatch }}
+      - name: Run UK interconnector update
         run: |
           set -euo pipefail
           FLAGS=""
           if [ "$FAIL_RECON" = "false" ]; then
             FLAGS="--allow-reconciliation-mismatch"
           fi
-          python pipelines/build_interconnectors.py \
-            --start "$START_MONTH" \
-            --end "$END_MONTH" \
-            $FLAGS
+          if [ "$RUN_MODE" = "full" ]; then
+            FULL_START="$START_MONTH"
+            if [ "$FULL_START" = "auto" ]; then
+              FULL_START="2020-12"
+            fi
+            python pipelines/build_interconnectors.py --start "$FULL_START" --end "$END_MONTH" $FLAGS
+          else
+            python pipelines/monthly_update_interconnectors.py --start "$START_MONTH" --end "$END_MONTH" --refetch-months "$REFETCH_MONTHS" $FLAGS
+          fi
 
       - name: Upload interconnector build report
         uses: actions/upload-artifact@v4
@@ -105,7 +128,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No generated output changes to commit."
           else
-            git commit -m "data: build UK interconnector flow parquet"
+            git commit -m "data(interconnectors): auto monthly fetch"
             git pull --ff-only origin main
-            git push origin HEAD:main
+            git push origin HEAD:${GITHUB_REF_NAME}
           fi
